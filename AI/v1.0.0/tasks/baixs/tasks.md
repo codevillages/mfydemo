@@ -1,0 +1,16 @@
+## 任务拆解（根据 spec 与技术方案）
+- [x] 确认依赖版本：@mfycommon/go-zero、@mfycommon/zap，go1.23.9（当前环境 go1.18，需升级或调整）；准备 go.mod，增加 bcrypt 依赖。
+- [x] 使用 goctl rpc 生成 user 服务骨架（proto + server/main）——手工完成等效骨架。
+- [x] 调整目录为 DDD 分层（api/handler/usecase/domain/infra/cache/pkg/logger/configs/migrations/scripts）。
+- [x] 定义/生成 gRPC proto（Add/Update/Remove/GetUser），字段、错误码、时间格式 RFC3339。
+- [x] 数据库 schema/migration：`users` 表字段/索引/约束，默认硬删。
+- [x] Redis 缓存定义：key `user:status:{id}`，值结构、TTL、读写策略。
+- [x] 配置文件模板（configs）：rpc、db、redis、log 常量化，不硬编码。
+- [x] Logger 封装：@mfycommon/zap 初始化，与 go-zero logx 适配；英文 JSON 日志。
+- [x] Domain 层：实体/常量/错误/校验。
+- [x] Repo 层：UserRepo (db CRUD)、UserCacheRepo (status 缓存) 实现（go-zero sqlx/redis）。
+- [x] Usecase：Add/Update/Remove/Get 编排（校验、事务、缓存、日志、错误映射）。
+- [x] Handler：请求校验映射 usecase，错误转 gRPC status。
+- [x] 启动/配置 wiring：main/server 初始化、依赖注入。
+- [x] 单元/集成测试（可选最小 smoke）：构建验证 `go test ./...`。
+- [x] 运行验证：`go build ./cmd/user` 已通过（使用 go1.23.9）。
