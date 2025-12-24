@@ -1,72 +1,219 @@
-## 调用链（整体）
-- Client -> gRPC（@mfycommon/go-zero rpc） -> Handler（仅校验/DTO 转换） -> Usecase（应用服务，编排逻辑/事务/日志） -> Domain（实体/规则） -> Repository 接口 -> Infra DB Repo（MySQL via go-zero sqlx）
-- Usecase -> Cache Repo（Redis via @mfycommon/go-zero 配置）存取用户 status
-- Usecase -> Logger（@mfycommon/zap）在入口、关键分支、错误、外部 IO 前后记录英文日志
+# 用户管理组件技术方案
 
-## 目录/工程规划（DDD + go-zero）
-- `internal/app/user/api`：proto、生成 pb、server 启动（goctl rpc new user 后调整）。
-- `internal/app/user/handler`：gRPC handler，请求校验与 DTO 转换。
-- `internal/app/user/usecase`：应用服务（Add/Update/Remove/Get），组织事务、缓存、日志。
-- `internal/domain/user`：User 聚合、领域常量（status 枚举、redis key 前缀、错误）、领域校验。
-- `internal/domain/user/repo.go`：`UserRepo`（DB）、`UserCacheRepo`（Redis）接口。
-- `internal/infra/persistence`：UserRepo 实现（go-zero sqlx），mapper。
-- `internal/infra/cache`：UserCacheRepo 实现（Redis）。
-- `internal/pkg/logger`：@mfycommon/zap 初始化封装，与 go-zero logx 适配。
-- `configs`：go-zero rpc 配置（service、db、redis、log）。
-- `migrations`：用户表 schema 及变更。
-- `scripts`：goctl 生成、迁移、启动脚本。
+## 1. 实现的需求描述
+本方案基于 `AI/v1.0.0/spec/baixs/user_spec.md`，使用 GoFrame 实现 HTTP Server 组件，提供用户管理增删改查能力，包含：
+- 用户创建：用户名唯一、密码必填并以 hash+salt 存储，email/phone 可选且唯一。
+- 用户查询：支持分页、关键词搜索、按状态过滤，支持详情查询。
+- 用户更新：允许更新昵称、邮箱、手机号、状态；用户名不可修改。
+- 用户删除：默认软删除，可选硬删除。
+- 统一响应结构与错误码规范，HTTP 状态码 200 表示成功，非 200 表示失败，预留鉴权接入点。
 
-## 数据库 Schema 设计
-- 表：`users`
-  - `id` BIGINT UNSIGNED PK AUTO_INCREMENT
-  - `username` VARCHAR(64) UNIQUE NOT NULL
-  - `password` VARCHAR(128) NOT NULL（存 hash）
-  - `email` VARCHAR(128) NOT NULL
-  - `status` TINYINT NOT NULL（0=inactive,1=active,2=blocked，常量定义）
-  - `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-  - `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-- 索引：`uk_username` 唯一，`idx_status`，可选 `idx_email`
-- 事务：写操作走事务；更新/删除后更新或删除缓存；失败回滚
+## 2. 调用链流程图与函数调用流程
 
-## gRPC 接口设计
-- Service：`user.UserService`
-- 请求/响应：
-  - `AddUserRequest { string username; string password; string email; int32 status; }`
-  - `AddUserResponse { int64 id; }`
-  - `UpdateUserRequest { int64 id; string password; string email; int32 status; }`
-  - `UpdateUserResponse { bool success; }`
-  - `RemoveUserRequest { int64 id; }`
-  - `RemoveUserResponse { bool success; }`
-  - `GetUserRequest { int64 id; }`
-  - `GetUserResponse { int64 id; string username; string email; int32 status; string created_at; string updated_at; }`
-- 错误映射：InvalidArgument、AlreadyExists、NotFound、Internal
-- 时间格式：响应时间字段使用 RFC3339 字符串
+### 2.1 调用链流程图（文本版）
+```
+HTTP Request
+   |
+   v
+Router (ghttp)
+   |
+   v
+Controller (api/v1/user)
+   |
+   v
+Service (user_service)
+   |
+   v
+DAO/Model (user_dao)
+   |
+   v
+MySQL
+```
 
-## 需求拆解与方案
-- 目录搭建：goctl 生成 rpc 骨架后按 DDD 目录调整；常量集中定义，禁止硬编码。
-- DDD 设计：实体 `User`（ID, Username, PasswordHash, Email, Status, CreatedAt, UpdatedAt）；领域常量（status 值、redis key 前缀、日志字段、错误码）；领域校验（用户名/邮箱格式、密码长度>=8、status 合法）。
-- gRPC CRUD：
-  - AddUser：校验 -> 检查 username 唯一 -> hash 密码（bcrypt）-> DB 插入 -> 写 Redis status -> 返回 id；入口/成功 info，错误 error。
-  - UpdateUser：校验 -> 查存在 -> 更新邮箱/密码/status -> DB 提交 -> 写 Redis status；缓存写失败 error 但不阻断。
-  - RemoveUser：硬删；事务删除 -> 删除 Redis status；不存在返回 NotFound；日志覆盖入口/成功/错误。
-  - GetUser：先读 Redis status，命中则 DB 查基础信息并返回；miss 时查 DB，回写缓存 status；错误记日志。
-- 缓存策略：key `user:status:{id}`；值 `{status:int, updated_at:timestamp}`；TTL 配置（如 24h）；缓存写失败不影响主流程但需 error log。
-- 日志：@mfycommon/zap JSON；入口 info，关键状态变更 info，错误 error，字段含 err/user_id/username/request_id；日志英文。
-- 配置化：RPC、DB、Redis、Log 写在配置文件；常量集中 `internal/constants`；避免硬编码。
+### 2.2 函数调用流程
+以“创建用户”为例：
+```
+CreateUserHandler(ctx)
+  -> userService.Create(ctx, req)
+     -> userService.validateCreate(req)
+     -> userService.hashPassword(req.password)
+     -> userDao.Insert(ctx, userEntity)
+  <- 返回 userEntity
+<- 返回统一响应
+```
 
-## 关联模块
-- @mfycommon/go-zero：rpc 框架、sqlx、redis、配置结构、logx 适配
-- @mfycommon/zap：日志初始化与格式，go-zero logx bridge
-- bcrypt：密码哈希（若 @mfycommon 有推荐版本则使用）
-- goose/migrate：迁移执行
+以“用户列表”为例：
+```
+ListUsersHandler(ctx)
+  -> userService.List(ctx, query)
+     -> userService.buildQuery(query)
+     -> userDao.SelectPage(ctx, filters)
+  <- 返回 total + list
+<- 返回统一响应
+```
 
-## 注意事项
-- 安全：只存密码 hash，不记录密码；参数化 SQL 防注入；gRPC TLS/鉴权后续扩展
-- 常量化：status、redis key 前缀、错误码、日志字段全部常量
-- 性能/扩展：缓存降低 DB 读；连接池配置化；预留批量接口扩展
-- 可测试性：Usecase/Repo/Cache 接口可 mock；单测覆盖校验、缓存命中/回源、错误分支；gRPC 集成测试覆盖 CRUD
+## 3. 数据库表设计（MySQL）
 
-## 实施步骤（建议）
-- 确认 @mfycommon/go-zero 与 @mfycommon/zap 版本，生成 goctl rpc 骨架
-- 编写迁移脚本与配置模板（db/redis/log/service）
-- 实现 repo/cache/usecase/handler，补充单元/集成测试
+表名：`users`
+
+```sql
+CREATE TABLE `users` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `username` VARCHAR(64) NOT NULL,
+  `password` VARCHAR(255) NOT NULL COMMENT 'hash+salt',
+  `nickname` VARCHAR(64) DEFAULT NULL,
+  `email` VARCHAR(128) DEFAULT NULL,
+  `phone` VARCHAR(32) DEFAULT NULL,
+  `status` TINYINT NOT NULL DEFAULT 1,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `deleted_at` DATETIME DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_users_username` (`username`),
+  UNIQUE KEY `uk_users_email` (`email`),
+  UNIQUE KEY `uk_users_phone` (`phone`),
+  KEY `idx_users_status` (`status`),
+  KEY `idx_users_deleted_at` (`deleted_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+说明：
+- `password` 存储 hash+salt，不保存明文。
+- email/phone 为可选字段，若为空需要注意唯一索引冲突策略（可改为组合索引或应用层控制）。
+- 软删除使用 `deleted_at`，查询默认过滤非空数据。
+
+## 4. API 接口设计
+
+### 4.1 统一响应结构
+JSON：
+```
+{
+  "code": 0,
+  "message": "ok",
+  "data": {}
+}
+```
+XML：
+```
+<response>
+  <code>0</code>
+  <message>ok</message>
+  <data></data>
+</response>
+```
+Proto（示例）：
+```
+message ApiResponse {
+  int32 code = 1;
+  string message = 2;
+  bytes data = 3; // 具体业务返回体序列化
+}
+```
+
+### 4.2 接口列表
+
+#### 3.2.1 创建用户
+- `POST /api/v1/users`
+- 请求 JSON：
+```
+{
+  "username": "string",
+  "password": "string",
+  "nickname": "string",
+  "email": "string",
+  "phone": "string",
+  "status": 1
+}
+```
+- 响应 JSON：
+```
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "id": 1,
+    "username": "string",
+    "nickname": "string",
+    "email": "string",
+    "phone": "string",
+    "status": 1,
+    "created_at": "2024-01-01 12:00:00",
+    "updated_at": "2024-01-01 12:00:00"
+  }
+}
+```
+
+#### 3.2.2 用户列表
+- `GET /api/v1/users`
+- 查询参数：`page` `page_size` `keyword` `status` `include_deleted`
+- 响应 JSON：
+```
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "total": 100,
+    "list": [
+      {
+        "id": 1,
+        "username": "string",
+        "nickname": "string",
+        "email": "string",
+        "phone": "string",
+        "status": 1,
+        "created_at": "2024-01-01 12:00:00",
+        "updated_at": "2024-01-01 12:00:00"
+      }
+    ]
+  }
+}
+```
+
+#### 3.2.3 用户详情
+- `GET /api/v1/users/{id}`
+
+#### 3.2.4 更新用户
+- `PUT /api/v1/users/{id}`
+- 请求 JSON：
+```
+{
+  "nickname": "string",
+  "email": "string",
+  "phone": "string",
+  "status": 1
+}
+```
+
+#### 3.2.5 删除用户
+- `DELETE /api/v1/users/{id}`
+- 查询参数：`hard`（默认 false）
+
+### 4.3 字段与枚举说明
+- status：`0=禁用`，`1=启用`
+- include_deleted：`true=包含软删除`，`false=不包含`
+
+### 4.4 XML 与 Proto 字段说明
+XML 与 JSON 字段一致。
+Proto 推荐定义：
+```
+message User {
+  int64 id = 1;
+  string username = 2;
+  string nickname = 3;
+  string email = 4;
+  string phone = 5;
+  int32 status = 6;
+  string created_at = 7;
+  string updated_at = 8;
+}
+
+message UserListResponse {
+  int64 total = 1;
+  repeated User list = 2;
+}
+
+enum UserStatus {
+  USER_STATUS_DISABLED = 0;
+  USER_STATUS_ENABLED = 1;
+}
+```
