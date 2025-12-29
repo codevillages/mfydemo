@@ -1,0 +1,22 @@
+server:
+  address: ":8080"
+  readTimeout: "10s"
+  writeTimeout: "10s"
+  idleTimeout: "60s"
+  maxHeaderBytes: 1048576
+  clientMaxBodySize: "8MB"
+  logLevel: "all"
+  logStdout: true
+  accessLogEnabled: true
+  errorLogEnabled: true
+
+database:
+  default:
+    type: "mysql"
+    # 示例：user:pass@tcp(127.0.0.1:3306)/userdb?charset=utf8mb4&parseTime=true&loc=Local
+    link: ""
+    maxIdle: 10
+    maxOpen: 50
+    debug: true
+    queryTimeout: "3s"
+    execTimeout: "3s"

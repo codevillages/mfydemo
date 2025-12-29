@@ -1,0 +1,21 @@
+server:
+  address: ":8080"
+  readTimeout: "10s"
+  writeTimeout: "10s"
+  idleTimeout: "60s"
+  clientMaxBodySize: "8MB"
+  logLevel: "all"
+  logStdout: true
+  accessLogEnabled: true
+  errorLogEnabled: true
+
+database:
+  default:
+    type: "mysql"
+    link: "root:123456@tcp(127.0.0.1:3306)/mfydemo_user?charset=utf8mb4&parseTime=true&loc=Local"
+    name: "mfydemo_user"
+    maxIdle: 10
+    maxOpen: 50
+    debug: true
+    queryTimeout: "3s"
+    execTimeout: "3s"
